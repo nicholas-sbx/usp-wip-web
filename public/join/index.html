@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="title" content="Join USPWIP Room" />
+    <meta
+      name="description"
+      content="You have been invited to join a USPWIP room"
+    />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="language" content="English" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>USPWIP Controller</title>
+    <style>
+      #pipContent {
+        /* hack we're using to hide the content when it's not popped into the PIP, there's probably a better way */
+        display: none !important;
+      }
+    </style>
+    <link rel="stylesheet" href="../global.css" />
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+  </head>
+
+  <body>
+    <div id="primaryUIWrap" data-active-screen="join">
+      <div id="joinUI">
+        <h1>Join USPWIP room as:</h1>
+        <input
+          id="nameInput"
+          type="text"
+          placeholder="Name"
+          maxlength="15"
+          autocomplete="off"
+          spellcheck="false"
+        /><br />
+        <h1>with pointer color:</h1>
+        <input id="colorInput" type="color" class="colorPicker" /><br />
+        <button id="joinButton" disabled>Join</button>
+      </div>
+      <div id="loadingUI">
+        <h1 id="loadingString"></h1>
+      </div>
+      <div id="joinedUI">
+        <h1 id="joinedString"></h1>
+        <button id="leaveButton">Leave</button>
+      </div>
+      <div id="failedUI">
+        <h1>
+          Connection failed. Either one of you has bad internet, or this room
+          doesn't exist anymore :(
+        </h1>
+        <button id="failedOkButton">Ok</button>
+      </div>
+    </div>
+    <div id="pipContent">
+      <!-- eventually we want this as a separate file so we can target pip body in styling -->
+      <style>
+        #pipContent,
+        #badUser,
+        #badWayland,
+        #goodUser {
+          display: grid;
+          place-items: center;
+          user-select: none;
+          position: fixed;
+          text-align: center;
+          padding: 10px;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          font-family: Arial, Helvetica, sans-serif;
+          line-height: 1.5em;
+        }
+
+        #goodUser {
+          background-color: #34393b;
+          color: white;
+        }
+
+        #goodUser.locked {
+          background-color: #55b8e6;
+          color: unset;
+        }
+
+        #badUser {
+          display: none;
+          z-index: 9999;
+          background-color: #ec4343;
+        }
+
+        #badWayland {
+          display: none;
+          z-index: 9999;
+          background-color: #ec4343;
+        }
+      </style>
+      <div id="goodUser">Left click here to control pointer</div>
+      <div id="badUser">
+        <!-- formatting for this message could use work -->
+        <p>
+          BAD! <strong>don't use ESC</strong> to release your mouse, right click
+          instead; left click to dismiss this message
+        </p>
+      </div>
+      <div id="badWayland">
+        <p>
+          It looks like you're using Wayland. Please run chrome/edge with
+          --ozone-platform=x11 or this PIP window likely won't behave as
+          expected.
+        </p>
+      </div>
+    </div>
+    <script src="script.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+* {
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button {
+  padding: 10px 30px 10px 30px;
+  border-radius: 9999px;
+  font-size: x-large;
+  margin: 20px;
+}
+
+button:focus {
+  border-color: black;
+  outline-color: black;
+}

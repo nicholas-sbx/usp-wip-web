@@ -1,0 +1,56 @@
+/* styles for the rest of the page go here for organization sake */
+
+#primaryUIWrap {
+  display: grid;
+  place-items: center;
+  user-select: none;
+  position: fixed;
+  text-align: center;
+  padding: 10px;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 30px;
+}
+
+#primaryUIWrap > div {
+  border: 10px solid gray;
+  border-radius: 30px;
+  padding: 20px;
+  max-width: 700px;
+  display: none;
+}
+
+#primaryUIWrap[data-active-screen='join'] > #joinUI,
+#primaryUIWrap[data-active-screen='loading'] > #loadingUI,
+#primaryUIWrap[data-active-screen='joined'] > #joinedUI,
+#primaryUIWrap[data-active-screen='failed'] > #failedUI {
+  display: unset;
+}
+
+input {
+  font-size: x-large;
+  border-radius: 10px;
+  padding: 5px 20px 5px 20px;
+  text-align: center;
+}
+
+.colorPicker {
+  width: 150px;
+  height: 50px;
+  /* border: none; */
+  padding: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.colorPicker::-webkit-color-swatch {
+  border: none;
+  border-radius: 0;
+}
+
+.colorPicker::-moz-color-swatch {
+  border: none;
+  border-radius: 0;
+}
