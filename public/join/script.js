@@ -15,12 +15,18 @@ const primaryUIWrap = document.getElementById('primaryUIWrap')
 const joinedString = document.getElementById('joinedString')
 const loadingString = document.getElementById('loadingString')
 const roomCode = window.location.hash.slice(1)
+// room codes are hex (8 chars for older hosts, 16 for current ones)
+const ROOM_CODE_PATTERN = /^[0-9a-f]{8,32}$/i
 
 window.addEventListener('hashchange', () => {
   location.reload()
 })
 
 joinButton.addEventListener('click', () => {
+  if (!ROOM_CODE_PATTERN.test(roomCode)) {
+    setUIFailed()
+    return
+  }
   joinRoom(nameInput.value.trim(), colorInput.value, roomCode, 1, 3)
 })
 
@@ -247,7 +253,11 @@ peer.on('disconnected', () => {
 function joinRoom(name, color, code, attemptNum, maxAttempts) {
   setUILoading(`Connecting${'.'.repeat(attemptNum)}`)
 
-  currentConn = peer.connect('uspwip-fun-super-unique-id-' + code)
+  // the desktop host only accepts JSON: PeerJS's default binary serializer
+  // reassembles chunked messages without limits, which a peer could abuse
+  currentConn = peer.connect('uspwip-fun-super-unique-id-' + code, {
+    serialization: 'json'
+  })
   const pingTimeout = setTimeout(() => {
     currentConn?.send({
       type: 'ping'
@@ -263,13 +273,14 @@ function joinRoom(name, color, code, attemptNum, maxAttempts) {
       }
     })
   })
+  let introduced = false
   currentConn.on('data', data => {
-    if (data?.type === 'host-introduction') {
-      setUIJoined(
-        `Connected to ${data?.content?.name
-          ?.substring(0, 15)
-          ?.trim()} as ${name}`
-      )
+    if (data?.type === 'host-introduction' && !introduced) {
+      introduced = true
+      const hostName = String(data?.content?.name ?? '')
+        .substring(0, 15)
+        .trim()
+      setUIJoined(`Connected to ${hostName} as ${name}`)
       launchPIP()
     }
   })
