@@ -93,12 +93,102 @@ const badUser = document.getElementById('badUser')
 const badWayland = document.getElementById('badWayland')
 var pipWindow
 var codeRequestedUnlock = false
+var lockRequestPending = false
+var lockLost = false // we released a lock the browser had already lost
+var likelyWayland = false
 
 var deltaX = 0
 var deltaY = 0
 var mousedown = false
 var active = false
 var flushTimer = null
+var lastSentAt = 0
+// how far the pointer has been moving per event lately (see acceptMovement)
+var recentMove = 0
+var lastMoveAt = 0
+
+// at most 50 movement updates a second (the host drops guests that send
+// more than 150 messages a second)
+const MOVE_INTERVAL_MS = 20
+// a single movement this big that's also far beyond the recent speed is bogus
+const JUMP_MIN_PX = 250
+const JUMP_FACTOR = 8
+
+function isLocked() {
+  return !!pipWindow && pipWindow.document?.pointerLockElement === goodUser
+}
+
+/**
+ * Asks for the pointer lock. On Wayland the compositor only turns the lock on
+ * while the cursor is still inside this window, so this runs as soon as the
+ * button goes down: waiting for the click (button up) gave a fast-moving
+ * cursor time to leave first, and the page then thought it had the mouse
+ * while the cursor wandered off.
+ */
+function lockPointer() {
+  if (lockRequestPending || !pipWindow || isLocked()) return
+  lockRequestPending = true
+  let request
+  try {
+    request = goodUser.requestPointerLock()
+  } catch (err) {
+    request = Promise.reject(err)
+  }
+  Promise.resolve(request)
+    .catch(err => {
+      // e.g. right after Esc, Chrome refuses for a moment: just click again
+      console.warn('Pointer lock refused:', err?.message ?? err)
+    })
+    .finally(() => {
+      lockRequestPending = false
+    })
+  focusTypeCapture()
+}
+
+/** releases the pointer lock (`lost`: the browser had already lost it) */
+function releasePointer(lost = false) {
+  if (!isLocked()) return
+  codeRequestedUnlock = true
+  lockLost = lost
+  pipWindow.document.exitPointerLock()
+}
+
+/**
+ * Whether a pointer movement is real. Chrome on Wayland can lose the pointer
+ * lock without telling the page (the compositor ends it, e.g. when something
+ * pops up under the hidden cursor). Its next movement is then one huge jump:
+ * the gap between where Chrome thought the hidden cursor went and where it
+ * really is. A hand speeds up over several events, so a lone jump far beyond
+ * the recent speed is dropped. On Wayland it means the lock is gone, so the
+ * page lets go of it too and says to click again (instead of claiming the
+ * mouse is still locked while the cursor is free).
+ */
+function acceptMovement(dx, dy) {
+  const now = performance.now()
+  if (now - lastMoveAt > 100) recentMove = 0 // stopped moving: start over
+  lastMoveAt = now
+  const distance = Math.hypot(dx, dy)
+  if (
+    distance > JUMP_MIN_PX &&
+    distance > JUMP_FACTOR * Math.max(recentMove, 15)
+  ) {
+    console.warn(`Ignored a ${Math.round(distance)}px pointer jump`)
+    if (likelyWayland) releasePointer(true)
+    return false
+  }
+  recentMove = recentMove * 0.6 + distance * 0.4
+  return true
+}
+
+/** sends the movement gathered so far along with the button/lock state */
+function sendPointerState() {
+  clearTimeout(flushTimer)
+  flushTimer = null
+  lastSentAt = performance.now()
+  sendMouseMove(deltaX, deltaY, mousedown, active)
+  deltaX = 0
+  deltaY = 0
+}
 
 function runOnLock() {
   goodUser.classList.add('locked')
@@ -106,9 +196,9 @@ function runOnLock() {
 
   active = true
   mousedown = false
-  sendMouseMove(deltaX, deltaY, mousedown, active)
-  deltaX = 0
-  deltaY = 0
+  recentMove = 0
+  lastMoveAt = 0
+  sendPointerState()
 }
 
 function runOnUnlock() {
@@ -118,12 +208,14 @@ function runOnUnlock() {
   codeRequestedUnlock = false
 
   goodUser.classList.remove('locked')
-  goodUser.textContent = 'Left click here to control pointer'
+  goodUser.textContent = lockLost
+    ? 'Lost the mouse. Left click here to control pointer again'
+    : 'Left click here to control pointer'
+  lockLost = false
 
   active = false
-  sendMouseMove(deltaX, deltaY, mousedown, active)
-  deltaX = 0
-  deltaY = 0
+  mousedown = false // its mouse up won't reach us anymore
+  sendPointerState()
 }
 
 async function launchPIP() {
@@ -136,11 +228,12 @@ async function launchPIP() {
     preferInitialWindowPlacement: true
   })
 
-  if (
+  // (Wayland doesn't tell apps where their windows are)
+  likelyWayland =
     pipWindow.screenX === 0 &&
     pipWindow.screenY === 0 &&
-    window.navigator?.platform?.includes('Linux')
-  ) {
+    !!window.navigator?.platform?.includes('Linux')
+  if (likelyWayland) {
     badWayland.style.display = 'grid'
   }
 
@@ -148,6 +241,8 @@ async function launchPIP() {
     document.body.append(e.target.getElementById('pipContent'))
     badUser.style.display = 'none'
     badWayland.style.display = 'none'
+    clearTimeout(flushTimer)
+    flushTimer = null
     pipWindow = null
     resetTyping()
     leaveRoom() // redundant if leave was triggered by somethign other than closing the PIP
@@ -161,6 +256,9 @@ async function launchPIP() {
   }
   pipWindow.onblur = () => {
     windowFocused = false
+    // the compositor ends the lock when this window loses focus; don't keep
+    // acting as if we still had it
+    releasePointer()
     updateTypePreview()
   }
   // A keystroke must never be lost: if focus ever slipped off the typing box,
@@ -183,60 +281,55 @@ async function launchPIP() {
   }
 
   pipWindow.document.onmousemove = e => {
-    if (pipWindow?.document?.pointerLockElement === goodUser) {
-      deltaX += e.movementX
-      deltaY += e.movementY
-      if (!flushTimer) {
-        flushTimer = setTimeout(() => {
-          flushTimer = null
-          if (deltaX + deltaY == 0) return
-          sendMouseMove(deltaX, deltaY, mousedown, active)
-          deltaX = 0
-          deltaY = 0
-        }, 20)
-      }
+    if (!isLocked() || !acceptMovement(e.movementX, e.movementY)) return
+    deltaX += e.movementX
+    deltaY += e.movementY
+    if (flushTimer) return
+    // send right away unless we just did; then once the interval is up
+    const wait = MOVE_INTERVAL_MS - (performance.now() - lastSentAt)
+    if (wait <= 0) {
+      sendPointerState()
+    } else {
+      flushTimer = setTimeout(() => {
+        flushTimer = null
+        if (deltaX !== 0 || deltaY !== 0) sendPointerState()
+      }, wait)
     }
   }
 
   pipWindow.document.onmouseup = e => {
-    if (
-      pipWindow?.document?.pointerLockElement === goodUser &&
-      e.button === 0
-    ) {
+    if (isLocked() && e.button === 0) {
       mousedown = false
-      sendMouseMove(deltaX, deltaY, mousedown, active)
-      deltaX = 0
-      deltaY = 0
+      sendPointerState()
     }
   }
 
   pipWindow.document.onmousedown = e => {
     e.preventDefault() // keep keyboard focus on the typing box
-    if (
-      pipWindow?.document?.pointerLockElement === goodUser &&
-      e.button === 0
-    ) {
+    if (!isLocked()) {
+      // (not when dismissing one of the messages on top)
+      if (e.button === 0 && e.target === goodUser) lockPointer()
+      return
+    }
+    if (e.button === 0) {
       mousedown = true
-      sendMouseMove(deltaX, deltaY, mousedown, active)
-      deltaX = 0
-      deltaY = 0
+      sendPointerState()
       pinDraft() // clicking pins whatever you're typing where the pointer is
     }
   }
 
-  goodUser.onclick = async e => {
-    if (e.button == 0 && pipWindow?.document?.pointerLockElement !== goodUser) {
-      // on kde plasma, if the browser is running under x11 and requests a lock when the x11 PIP window is over a wayland window, the browser sometimes reports a lock even though we don't have one; we don't really have a fix for this at the moment
-      await goodUser.requestPointerLock()
-      focusTypeCapture()
-    } else if (e.button == 2 && pipWindow) {
-      // right click only fires "onclick" when pointer is locked; tested in chrome & edge
-      codeRequestedUnlock = true
-      pipWindow.document.exitPointerLock()
-    }
-
+  goodUser.onclick = e => {
     e.preventDefault()
     e.stopPropagation()
+    if (e.button === 0 && !isLocked()) {
+      // normally already requested on mouse down; this retries if that failed
+      // on kde plasma, if the browser is running under x11 and requests a lock when the x11 PIP window is over a wayland window, the browser sometimes reports a lock even though we don't have one; we don't really have a fix for this at the moment
+      lockPointer()
+    } else if (e.button === 2) {
+      // right click only fires "onclick" when pointer is locked (Blink follows
+      // every mouse up with a click then); tested in chrome & edge
+      releasePointer()
+    }
   }
 
   // prevent right click when pointer isn't locked
@@ -258,11 +351,18 @@ async function launchPIP() {
   }
 
   codeRequestedUnlock = false
+  lockRequestPending = false
+  lockLost = false
   deltaX = 0
   deltaY = 0
   mousedown = false
   active = false
   flushTimer = null
+  lastSentAt = 0
+  recentMove = 0
+  lastMoveAt = 0
+  goodUser.classList.remove('locked')
+  goodUser.textContent = 'Left click here to control pointer'
   resetTyping()
   pipWindow.document.body.append(pipContent)
   windowFocused = pipWindow.document.hasFocus()
