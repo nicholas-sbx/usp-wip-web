@@ -272,15 +272,17 @@ async function launchPIP() {
 
 // ========== typing logic ==========
 // While the PiP window has focus, what you type shows up next to your pointer
-// on the host's screen. It fades once you stop typing; clicking pins it there
-// as a note. Every update carries the whole text plus a sequence number, since
-// PeerJS data channels don't guarantee ordering.
+// on the host's screen. Once you stop typing it stays a while (longer for
+// longer text) and fades; the host then sends host-draft-expired and the box
+// here is cleared too. Clicking pins the text there as a note. Every update
+// carries the whole text plus a sequence number, since PeerJS data channels
+// don't guarantee ordering.
 
 const typeCapture = document.getElementById('typeCapture')
 const typePreview = document.getElementById('typePreview')
 const DEFAULT_TYPING = {
-  idleMs: 2500,
   fadeMs: 1500,
+  maxHoldMs: 10000,
   maxLength: 200,
   maxLines: 5
 }
@@ -315,8 +317,8 @@ function configureTyping(config) {
     const pick = (value, min, max, fallback) =>
       Number.isFinite(value) && value >= min && value <= max ? value : fallback
     typing = {
-      idleMs: pick(config.idleMs, 200, 60000, DEFAULT_TYPING.idleMs),
       fadeMs: pick(config.fadeMs, 0, 60000, DEFAULT_TYPING.fadeMs),
+      maxHoldMs: pick(config.maxHoldMs, 0, 60000, DEFAULT_TYPING.maxHoldMs),
       maxLength: pick(config.maxLength, 1, 1000, DEFAULT_TYPING.maxLength),
       maxLines: pick(config.maxLines, 1, 50, DEFAULT_TYPING.maxLines)
     }
@@ -396,7 +398,17 @@ function sendText() {
   currentConn.send({ type: 'client-text', content: { text, seq: ++textSeq } })
 }
 
-/** once you stop typing the host fades the text out; forget it at the same time */
+/** the host has faded out exactly what this box holds: start fresh */
+function onDraftExpired(seq) {
+  if (seq !== textSeq || typeCapture.value !== lastSentText || composing) return
+  clearTimeout(textClearTimer)
+  typeCapture.value = ''
+  lastSentText = ''
+  limitUntil = 0
+  updateTypePreview()
+}
+
+/** fallback if the host never says the text is gone (it always should) */
 function clearDraft() {
   if (composing) {
     textClearTimer = setTimeout(clearDraft, 500)
@@ -448,7 +460,10 @@ typeCapture.addEventListener('input', () => {
   if (!textSendTimer) textSendTimer = setTimeout(sendText, 40)
   clearTimeout(textClearTimer)
   if (typeCapture.value) {
-    textClearTimer = setTimeout(clearDraft, typing.idleMs + typing.fadeMs)
+    textClearTimer = setTimeout(
+      clearDraft,
+      typing.maxHoldMs + typing.fadeMs + 3000
+    )
   }
 })
 
@@ -542,6 +557,8 @@ function joinRoom(name, color, code, attemptNum, maxAttempts) {
       setUIJoined(`Connected to ${hostName} as ${name}`)
       configureTyping(data?.content?.typing) // absent = older host
       launchPIP()
+    } else if (data?.type === 'host-draft-expired') {
+      onDraftExpired(data?.content?.seq)
     }
   })
   currentConn.on('error', () => {
