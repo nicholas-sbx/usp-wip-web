@@ -149,8 +149,30 @@ async function launchPIP() {
     badUser.style.display = 'none'
     badWayland.style.display = 'none'
     pipWindow = null
+    resetTyping()
     leaveRoom() // redundant if leave was triggered by somethign other than closing the PIP
   }
+
+  // whenever the PiP window has focus, keystrokes go to the (hidden) typing box
+  pipWindow.onfocus = () => {
+    windowFocused = true
+    focusTypeCapture()
+    updateTypePreview()
+  }
+  pipWindow.onblur = () => {
+    windowFocused = false
+    updateTypePreview()
+  }
+  // A keystroke must never be lost: if focus ever slipped off the typing box,
+  // move it back before the key is handled; the browser then delivers the
+  // character to the box (capture phase runs before anything else).
+  pipWindow.document.addEventListener(
+    'keydown',
+    () => {
+      if (pipWindow?.document?.activeElement !== typeCapture) focusTypeCapture()
+    },
+    true
+  )
 
   pipWindow.document.onpointerlockchange = () => {
     if (pipWindow?.document?.pointerLockElement === goodUser) {
@@ -189,6 +211,7 @@ async function launchPIP() {
   }
 
   pipWindow.document.onmousedown = e => {
+    e.preventDefault() // keep keyboard focus on the typing box
     if (
       pipWindow?.document?.pointerLockElement === goodUser &&
       e.button === 0
@@ -197,6 +220,7 @@ async function launchPIP() {
       sendMouseMove(deltaX, deltaY, mousedown, active)
       deltaX = 0
       deltaY = 0
+      pinDraft() // clicking pins whatever you're typing where the pointer is
     }
   }
 
@@ -204,6 +228,7 @@ async function launchPIP() {
     if (e.button == 0 && pipWindow?.document?.pointerLockElement !== goodUser) {
       // on kde plasma, if the browser is running under x11 and requests a lock when the x11 PIP window is over a wayland window, the browser sometimes reports a lock even though we don't have one; we don't really have a fix for this at the moment
       await goodUser.requestPointerLock()
+      focusTypeCapture()
     } else if (e.button == 2 && pipWindow) {
       // right click only fires "onclick" when pointer is locked; tested in chrome & edge
       codeRequestedUnlock = true
@@ -238,8 +263,257 @@ async function launchPIP() {
   mousedown = false
   active = false
   flushTimer = null
+  resetTyping()
   pipWindow.document.body.append(pipContent)
+  windowFocused = pipWindow.document.hasFocus()
+  focusTypeCapture()
+  updateTypePreview()
 }
+
+// ========== typing logic ==========
+// While the PiP window has focus, what you type shows up next to your pointer
+// on the host's screen. Once you stop typing it stays a while (longer for
+// longer text) and fades; the host then sends host-draft-expired and the box
+// here is cleared too. Clicking pins the text there as a note. Every update
+// carries the whole text plus a sequence number, since PeerJS data channels
+// don't guarantee ordering.
+
+const typeCapture = document.getElementById('typeCapture')
+const typePreview = document.getElementById('typePreview')
+const DEFAULT_TYPING = {
+  fadeMs: 1500,
+  maxHoldMs: 10000,
+  maxLength: 200,
+  maxLines: 5
+}
+const BLOCKED_KEYS = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+  'Tab'
+])
+var typing = null // set by host-introduction; null = host can't show typing
+var textSeq = 0
+var lastSentText = ''
+var textSendTimer = null
+var textClearTimer = null
+var composing = false
+var windowFocused = false
+// when something you typed didn't fit, the preview says so for a moment
+// (nothing is ever dropped silently)
+var limitUntil = 0
+var limitReason = ''
+const LIMIT_NOTICE_MS = 2500
+
+function configureTyping(config) {
+  if (!config || typeof config !== 'object') {
+    typing = null
+  } else {
+    const pick = (value, min, max, fallback) =>
+      Number.isFinite(value) && value >= min && value <= max ? value : fallback
+    typing = {
+      fadeMs: pick(config.fadeMs, 0, 60000, DEFAULT_TYPING.fadeMs),
+      maxHoldMs: pick(config.maxHoldMs, 0, 60000, DEFAULT_TYPING.maxHoldMs),
+      maxLength: pick(config.maxLength, 1, 1000, DEFAULT_TYPING.maxLength),
+      maxLines: pick(config.maxLines, 1, 50, DEFAULT_TYPING.maxLines)
+    }
+    typeCapture.maxLength = typing.maxLength
+  }
+  resetTyping()
+}
+
+function focusTypeCapture() {
+  if (pipWindow && typing && pipWindow.document.activeElement !== typeCapture) {
+    typeCapture.focus({ preventScroll: true })
+  }
+}
+
+function keepCaretAtEnd() {
+  const end = typeCapture.value.length
+  if (
+    !composing &&
+    (typeCapture.selectionStart !== end || typeCapture.selectionEnd !== end)
+  ) {
+    typeCapture.setSelectionRange(end, end)
+  }
+}
+
+function updateTypePreview() {
+  typePreview.hidden = !typing
+  if (!typing) return
+  const text = typeCapture.value
+  const atLimit = Date.now() < limitUntil
+  typePreview.classList.toggle('empty', !text && !atLimit)
+  typePreview.classList.toggle('limit', atLimit)
+  if (!text && !atLimit) {
+    typePreview.textContent = windowFocused
+      ? 'Type to write next to your pointer, click to pin it'
+      : 'Click this window to type'
+    return
+  }
+  // nearly full: show how much room is left; over: say what didn't fit
+  let prefix = ''
+  if (atLimit) {
+    prefix =
+      limitReason === 'lines'
+        ? `Max ${typing.maxLines} lines! `
+        : `Full (${typing.maxLength} characters)! `
+  } else if (text.length >= typing.maxLength * 0.8) {
+    prefix = `${text.length}/${typing.maxLength}: `
+  }
+  // show the end of what you're typing (whole characters, not half an emoji)
+  const room = 60 - prefix.length
+  const chars = Array.from(text.replace(/\n/g, ' \u21b5 '))
+  typePreview.textContent =
+    prefix +
+    (chars.length > room
+      ? '\u2026' + chars.slice(-(room - 1)).join('')
+      : chars.join(''))
+}
+
+function flagLimit(reason) {
+  limitReason = reason
+  limitUntil = Date.now() + LIMIT_NOTICE_MS
+  updateTypePreview()
+  setTimeout(updateTypePreview, LIMIT_NOTICE_MS + 50)
+}
+
+/** characters the box can still take (replacing a selection frees its room) */
+function roomLeft() {
+  const selected = typeCapture.selectionEnd - typeCapture.selectionStart
+  return typing.maxLength - (typeCapture.value.length - selected)
+}
+
+function sendText() {
+  clearTimeout(textSendTimer)
+  textSendTimer = null
+  const text = typeCapture.value
+  if (text === lastSentText || !currentConn) return
+  lastSentText = text
+  currentConn.send({ type: 'client-text', content: { text, seq: ++textSeq } })
+}
+
+/** the host has faded out exactly what this box holds: start fresh */
+function onDraftExpired(seq) {
+  if (seq !== textSeq || typeCapture.value !== lastSentText || composing) return
+  clearTimeout(textClearTimer)
+  typeCapture.value = ''
+  lastSentText = ''
+  limitUntil = 0
+  updateTypePreview()
+}
+
+/** fallback if the host never says the text is gone (it always should) */
+function clearDraft() {
+  if (composing) {
+    textClearTimer = setTimeout(clearDraft, 500)
+    return
+  }
+  typeCapture.value = ''
+  limitUntil = 0
+  updateTypePreview()
+  sendText()
+}
+
+function pinDraft() {
+  const text = typeCapture.value
+  if (!typing || !text.trim() || !currentConn) return
+  clearTimeout(textSendTimer)
+  clearTimeout(textClearTimer)
+  textSendTimer = null
+  currentConn.send({ type: 'client-pin', content: { text, seq: ++textSeq } })
+  typeCapture.value = ''
+  lastSentText = ''
+  limitUntil = 0
+  updateTypePreview()
+}
+
+function resetTyping() {
+  clearTimeout(textSendTimer)
+  clearTimeout(textClearTimer)
+  textSendTimer = null
+  typeCapture.value = ''
+  lastSentText = ''
+  composing = false
+  limitUntil = 0
+  updateTypePreview()
+}
+
+typeCapture.addEventListener('input', () => {
+  if (!typing) {
+    typeCapture.value = ''
+    return
+  }
+  const lines = typeCapture.value.split('\n')
+  if (lines.length > typing.maxLines) {
+    // (only a paste can get here; typing Enter is stopped in keydown)
+    typeCapture.value = lines.slice(0, typing.maxLines).join('\n')
+    flagLimit('lines')
+  }
+  keepCaretAtEnd()
+  updateTypePreview()
+  if (!textSendTimer) textSendTimer = setTimeout(sendText, 40)
+  clearTimeout(textClearTimer)
+  if (typeCapture.value) {
+    textClearTimer = setTimeout(
+      clearDraft,
+      typing.maxHoldMs + typing.fadeMs + 3000
+    )
+  }
+})
+
+typeCapture.addEventListener('keydown', e => {
+  if (e.isComposing) return
+  // the caret always stays at the end: no moving it or selecting text
+  if (
+    BLOCKED_KEYS.has(e.key) ||
+    ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a')
+  ) {
+    e.preventDefault()
+  } else if (e.key === 'Escape') {
+    // (while the pointer is locked, Escape is the browser's "release mouse")
+    if (pipWindow?.document?.pointerLockElement !== goodUser) {
+      e.preventDefault()
+      clearTimeout(textClearTimer)
+      clearDraft()
+    }
+  } else if (
+    e.key === 'Enter' &&
+    typeCapture.value.split('\n').length >= (typing?.maxLines ?? 1)
+  ) {
+    e.preventDefault()
+    flagLimit('lines')
+  }
+})
+
+// the box's maxlength silently ignores what doesn't fit: say so instead
+typeCapture.addEventListener('beforeinput', e => {
+  if (!typing || e.inputType === 'insertFromPaste') return
+  if (!e.inputType.startsWith('insert')) return
+  const incoming = e.inputType === 'insertLineBreak' ? '\n' : (e.data ?? '')
+  if (incoming.length > roomLeft()) flagLimit('characters')
+})
+typeCapture.addEventListener('paste', e => {
+  if (!typing) return
+  const pasted = e.clipboardData?.getData('text') ?? ''
+  if (pasted.length > roomLeft()) flagLimit('characters')
+})
+
+typeCapture.addEventListener('compositionstart', () => {
+  composing = true
+})
+typeCapture.addEventListener('compositionend', () => {
+  composing = false
+  keepCaretAtEnd()
+})
+typeCapture.addEventListener('blur', () => {
+  setTimeout(focusTypeCapture, 0)
+})
 
 // ========== comms logic ==========
 
@@ -281,7 +555,10 @@ function joinRoom(name, color, code, attemptNum, maxAttempts) {
         .substring(0, 15)
         .trim()
       setUIJoined(`Connected to ${hostName} as ${name}`)
+      configureTyping(data?.content?.typing) // absent = older host
       launchPIP()
+    } else if (data?.type === 'host-draft-expired') {
+      onDraftExpired(data?.content?.seq)
     }
   })
   currentConn.on('error', () => {
