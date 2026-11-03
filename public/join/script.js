@@ -154,7 +154,25 @@ async function launchPIP() {
   }
 
   // whenever the PiP window has focus, keystrokes go to the (hidden) typing box
-  pipWindow.onfocus = focusTypeCapture
+  pipWindow.onfocus = () => {
+    windowFocused = true
+    focusTypeCapture()
+    updateTypePreview()
+  }
+  pipWindow.onblur = () => {
+    windowFocused = false
+    updateTypePreview()
+  }
+  // A keystroke must never be lost: if focus ever slipped off the typing box,
+  // move it back before the key is handled; the browser then delivers the
+  // character to the box (capture phase runs before anything else).
+  pipWindow.document.addEventListener(
+    'keydown',
+    () => {
+      if (pipWindow?.document?.activeElement !== typeCapture) focusTypeCapture()
+    },
+    true
+  )
 
   pipWindow.document.onpointerlockchange = () => {
     if (pipWindow?.document?.pointerLockElement === goodUser) {
@@ -247,7 +265,9 @@ async function launchPIP() {
   flushTimer = null
   resetTyping()
   pipWindow.document.body.append(pipContent)
+  windowFocused = pipWindow.document.hasFocus()
   focusTypeCapture()
+  updateTypePreview()
 }
 
 // ========== typing logic ==========
@@ -281,6 +301,12 @@ var lastSentText = ''
 var textSendTimer = null
 var textClearTimer = null
 var composing = false
+var windowFocused = false
+// when something you typed didn't fit, the preview says so for a moment
+// (nothing is ever dropped silently)
+var limitUntil = 0
+var limitReason = ''
+const LIMIT_NOTICE_MS = 2500
 
 function configureTyping(config) {
   if (!config || typeof config !== 'object') {
@@ -317,17 +343,48 @@ function keepCaretAtEnd() {
 
 function updateTypePreview() {
   typePreview.hidden = !typing
+  if (!typing) return
   const text = typeCapture.value
-  typePreview.classList.toggle('empty', !text)
-  if (!text) {
-    typePreview.textContent =
-      'Type to write next to your pointer, click to pin it'
+  const atLimit = Date.now() < limitUntil
+  typePreview.classList.toggle('empty', !text && !atLimit)
+  typePreview.classList.toggle('limit', atLimit)
+  if (!text && !atLimit) {
+    typePreview.textContent = windowFocused
+      ? 'Type to write next to your pointer, click to pin it'
+      : 'Click this window to type'
     return
   }
+  // nearly full: show how much room is left; over: say what didn't fit
+  let prefix = ''
+  if (atLimit) {
+    prefix =
+      limitReason === 'lines'
+        ? `Max ${typing.maxLines} lines! `
+        : `Full (${typing.maxLength} characters)! `
+  } else if (text.length >= typing.maxLength * 0.8) {
+    prefix = `${text.length}/${typing.maxLength}: `
+  }
   // show the end of what you're typing (whole characters, not half an emoji)
+  const room = 60 - prefix.length
   const chars = Array.from(text.replace(/\n/g, ' \u21b5 '))
   typePreview.textContent =
-    chars.length > 60 ? '\u2026' + chars.slice(-59).join('') : chars.join('')
+    prefix +
+    (chars.length > room
+      ? '\u2026' + chars.slice(-(room - 1)).join('')
+      : chars.join(''))
+}
+
+function flagLimit(reason) {
+  limitReason = reason
+  limitUntil = Date.now() + LIMIT_NOTICE_MS
+  updateTypePreview()
+  setTimeout(updateTypePreview, LIMIT_NOTICE_MS + 50)
+}
+
+/** characters the box can still take (replacing a selection frees its room) */
+function roomLeft() {
+  const selected = typeCapture.selectionEnd - typeCapture.selectionStart
+  return typing.maxLength - (typeCapture.value.length - selected)
 }
 
 function sendText() {
@@ -346,6 +403,7 @@ function clearDraft() {
     return
   }
   typeCapture.value = ''
+  limitUntil = 0
   updateTypePreview()
   sendText()
 }
@@ -359,6 +417,7 @@ function pinDraft() {
   currentConn.send({ type: 'client-pin', content: { text, seq: ++textSeq } })
   typeCapture.value = ''
   lastSentText = ''
+  limitUntil = 0
   updateTypePreview()
 }
 
@@ -369,6 +428,7 @@ function resetTyping() {
   typeCapture.value = ''
   lastSentText = ''
   composing = false
+  limitUntil = 0
   updateTypePreview()
 }
 
@@ -379,7 +439,9 @@ typeCapture.addEventListener('input', () => {
   }
   const lines = typeCapture.value.split('\n')
   if (lines.length > typing.maxLines) {
+    // (only a paste can get here; typing Enter is stopped in keydown)
     typeCapture.value = lines.slice(0, typing.maxLines).join('\n')
+    flagLimit('lines')
   }
   keepCaretAtEnd()
   updateTypePreview()
@@ -410,7 +472,21 @@ typeCapture.addEventListener('keydown', e => {
     typeCapture.value.split('\n').length >= (typing?.maxLines ?? 1)
   ) {
     e.preventDefault()
+    flagLimit('lines')
   }
+})
+
+// the box's maxlength silently ignores what doesn't fit: say so instead
+typeCapture.addEventListener('beforeinput', e => {
+  if (!typing || e.inputType === 'insertFromPaste') return
+  if (!e.inputType.startsWith('insert')) return
+  const incoming = e.inputType === 'insertLineBreak' ? '\n' : (e.data ?? '')
+  if (incoming.length > roomLeft()) flagLimit('characters')
+})
+typeCapture.addEventListener('paste', e => {
+  if (!typing) return
+  const pasted = e.clipboardData?.getData('text') ?? ''
+  if (pasted.length > roomLeft()) flagLimit('characters')
 })
 
 typeCapture.addEventListener('compositionstart', () => {
