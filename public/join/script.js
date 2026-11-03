@@ -149,8 +149,12 @@ async function launchPIP() {
     badUser.style.display = 'none'
     badWayland.style.display = 'none'
     pipWindow = null
+    resetTyping()
     leaveRoom() // redundant if leave was triggered by somethign other than closing the PIP
   }
+
+  // whenever the PiP window has focus, keystrokes go to the (hidden) typing box
+  pipWindow.onfocus = focusTypeCapture
 
   pipWindow.document.onpointerlockchange = () => {
     if (pipWindow?.document?.pointerLockElement === goodUser) {
@@ -189,6 +193,7 @@ async function launchPIP() {
   }
 
   pipWindow.document.onmousedown = e => {
+    e.preventDefault() // keep keyboard focus on the typing box
     if (
       pipWindow?.document?.pointerLockElement === goodUser &&
       e.button === 0
@@ -197,6 +202,7 @@ async function launchPIP() {
       sendMouseMove(deltaX, deltaY, mousedown, active)
       deltaX = 0
       deltaY = 0
+      pinDraft() // clicking pins whatever you're typing where the pointer is
     }
   }
 
@@ -204,6 +210,7 @@ async function launchPIP() {
     if (e.button == 0 && pipWindow?.document?.pointerLockElement !== goodUser) {
       // on kde plasma, if the browser is running under x11 and requests a lock when the x11 PIP window is over a wayland window, the browser sometimes reports a lock even though we don't have one; we don't really have a fix for this at the moment
       await goodUser.requestPointerLock()
+      focusTypeCapture()
     } else if (e.button == 2 && pipWindow) {
       // right click only fires "onclick" when pointer is locked; tested in chrome & edge
       codeRequestedUnlock = true
@@ -238,8 +245,184 @@ async function launchPIP() {
   mousedown = false
   active = false
   flushTimer = null
+  resetTyping()
   pipWindow.document.body.append(pipContent)
+  focusTypeCapture()
 }
+
+// ========== typing logic ==========
+// While the PiP window has focus, what you type shows up next to your pointer
+// on the host's screen. It fades once you stop typing; clicking pins it there
+// as a note. Every update carries the whole text plus a sequence number, since
+// PeerJS data channels don't guarantee ordering.
+
+const typeCapture = document.getElementById('typeCapture')
+const typePreview = document.getElementById('typePreview')
+const DEFAULT_TYPING = {
+  idleMs: 2500,
+  fadeMs: 1500,
+  maxLength: 200,
+  maxLines: 5
+}
+const BLOCKED_KEYS = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+  'Tab'
+])
+var typing = null // set by host-introduction; null = host can't show typing
+var textSeq = 0
+var lastSentText = ''
+var textSendTimer = null
+var textClearTimer = null
+var composing = false
+
+function configureTyping(config) {
+  if (!config || typeof config !== 'object') {
+    typing = null
+  } else {
+    const pick = (value, min, max, fallback) =>
+      Number.isFinite(value) && value >= min && value <= max ? value : fallback
+    typing = {
+      idleMs: pick(config.idleMs, 200, 60000, DEFAULT_TYPING.idleMs),
+      fadeMs: pick(config.fadeMs, 0, 60000, DEFAULT_TYPING.fadeMs),
+      maxLength: pick(config.maxLength, 1, 1000, DEFAULT_TYPING.maxLength),
+      maxLines: pick(config.maxLines, 1, 50, DEFAULT_TYPING.maxLines)
+    }
+    typeCapture.maxLength = typing.maxLength
+  }
+  resetTyping()
+}
+
+function focusTypeCapture() {
+  if (pipWindow && typing && pipWindow.document.activeElement !== typeCapture) {
+    typeCapture.focus({ preventScroll: true })
+  }
+}
+
+function keepCaretAtEnd() {
+  const end = typeCapture.value.length
+  if (
+    !composing &&
+    (typeCapture.selectionStart !== end || typeCapture.selectionEnd !== end)
+  ) {
+    typeCapture.setSelectionRange(end, end)
+  }
+}
+
+function updateTypePreview() {
+  typePreview.hidden = !typing
+  const text = typeCapture.value
+  typePreview.classList.toggle('empty', !text)
+  if (!text) {
+    typePreview.textContent =
+      'Type to write next to your pointer, click to pin it'
+    return
+  }
+  // show the end of what you're typing (whole characters, not half an emoji)
+  const chars = Array.from(text.replace(/\n/g, ' \u21b5 '))
+  typePreview.textContent =
+    chars.length > 60 ? '\u2026' + chars.slice(-59).join('') : chars.join('')
+}
+
+function sendText() {
+  clearTimeout(textSendTimer)
+  textSendTimer = null
+  const text = typeCapture.value
+  if (text === lastSentText || !currentConn) return
+  lastSentText = text
+  currentConn.send({ type: 'client-text', content: { text, seq: ++textSeq } })
+}
+
+/** once you stop typing the host fades the text out; forget it at the same time */
+function clearDraft() {
+  if (composing) {
+    textClearTimer = setTimeout(clearDraft, 500)
+    return
+  }
+  typeCapture.value = ''
+  updateTypePreview()
+  sendText()
+}
+
+function pinDraft() {
+  const text = typeCapture.value
+  if (!typing || !text.trim() || !currentConn) return
+  clearTimeout(textSendTimer)
+  clearTimeout(textClearTimer)
+  textSendTimer = null
+  currentConn.send({ type: 'client-pin', content: { text, seq: ++textSeq } })
+  typeCapture.value = ''
+  lastSentText = ''
+  updateTypePreview()
+}
+
+function resetTyping() {
+  clearTimeout(textSendTimer)
+  clearTimeout(textClearTimer)
+  textSendTimer = null
+  typeCapture.value = ''
+  lastSentText = ''
+  composing = false
+  updateTypePreview()
+}
+
+typeCapture.addEventListener('input', () => {
+  if (!typing) {
+    typeCapture.value = ''
+    return
+  }
+  const lines = typeCapture.value.split('\n')
+  if (lines.length > typing.maxLines) {
+    typeCapture.value = lines.slice(0, typing.maxLines).join('\n')
+  }
+  keepCaretAtEnd()
+  updateTypePreview()
+  if (!textSendTimer) textSendTimer = setTimeout(sendText, 40)
+  clearTimeout(textClearTimer)
+  if (typeCapture.value) {
+    textClearTimer = setTimeout(clearDraft, typing.idleMs + typing.fadeMs)
+  }
+})
+
+typeCapture.addEventListener('keydown', e => {
+  if (e.isComposing) return
+  // the caret always stays at the end: no moving it or selecting text
+  if (
+    BLOCKED_KEYS.has(e.key) ||
+    ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a')
+  ) {
+    e.preventDefault()
+  } else if (e.key === 'Escape') {
+    // (while the pointer is locked, Escape is the browser's "release mouse")
+    if (pipWindow?.document?.pointerLockElement !== goodUser) {
+      e.preventDefault()
+      clearTimeout(textClearTimer)
+      clearDraft()
+    }
+  } else if (
+    e.key === 'Enter' &&
+    typeCapture.value.split('\n').length >= (typing?.maxLines ?? 1)
+  ) {
+    e.preventDefault()
+  }
+})
+
+typeCapture.addEventListener('compositionstart', () => {
+  composing = true
+})
+typeCapture.addEventListener('compositionend', () => {
+  composing = false
+  keepCaretAtEnd()
+})
+typeCapture.addEventListener('blur', () => {
+  setTimeout(focusTypeCapture, 0)
+})
 
 // ========== comms logic ==========
 
@@ -281,6 +464,7 @@ function joinRoom(name, color, code, attemptNum, maxAttempts) {
         .substring(0, 15)
         .trim()
       setUIJoined(`Connected to ${hostName} as ${name}`)
+      configureTyping(data?.content?.typing) // absent = older host
       launchPIP()
     }
   })
