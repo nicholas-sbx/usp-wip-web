@@ -6,12 +6,12 @@ The guest side of [USPWIP Desktop](https://github.com/nicholas-sbx/usp-wip-deskt
 
 In the Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to Git**, pick this repository, then:
 
-| Setting | Value |
-| --- | --- |
-| Production branch | `main` |
-| Framework preset | None |
-| Build command | *(empty)* |
-| Build output directory | `public` |
+| Setting                | Value     |
+| ---------------------- | --------- |
+| Production branch      | `main`    |
+| Framework preset       | None      |
+| Build command          | _(empty)_ |
+| Build output directory | `public`  |
 
 Every push to `main` then deploys, and other branches get preview URLs. `public/_headers` adds response headers Cloudflare serves with every page (anti-framing, no MIME sniffing, no referrer, long caching for the versioned PeerJS file).
 
